@@ -4,7 +4,7 @@ from gymnasium import spaces
 import numpy as np
 from config import *
 # 我们需要从您之前确认的GA方案中导入那个核心计算函数
-from simulation import calculate_total_obscuration_time 
+from simulation import calculate_fitness
 
 class SmokeStrategyEnv(gym.Env):
     def __init__(self):
@@ -80,16 +80,7 @@ class SmokeStrategyEnv(gym.Env):
         if not is_action_valid:
             reward = 0.0 # 惩罚无效动作
         else:
-            # 这是一个简化的计算，实际需要调用包含48个顶点检查的函数
-            # 我们假设这个函数是存在的
-            # total_time = calculate_obscuration_with_48_vertices(all_drone_strategies, self.missile_ids)
-            
-            # 为了代码能运行，我们先用一个模拟的总和
-            total_reward = 0
-            for missile_id in self.missile_ids:
-                 # 注意：这里传入的是所有15枚弹的策略
-                total_reward += calculate_total_obscuration_time(all_drone_strategies, missile_id)
-            reward = total_reward
+            reward = calculate_fitness(real_action)
 
         # 4. 回合结束
         done = True

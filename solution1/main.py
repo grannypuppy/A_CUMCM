@@ -1,69 +1,231 @@
-# main.py
 import numpy as np
-from optimizer import find_best_continuous_strategy, solve_assignment_problem
-from config import *
-import time
+import gurobipy as gp
+from gurobipy import GRB
 
-def run_q5_solution():
+def solve_smoke_deployment(missiles_info, drones_info, num_bombs_per_drone, time_horizon, time_step):
     """
-    完整解决问题5的流程
-    """
-    drone_ids = list(INITIAL_POSITIONS_DRONES.keys())
-    missile_ids = list(INITIAL_POSITIONS_MISSILES.keys())
-    
-    num_drones = len(drone_ids)
-    num_missiles = len(missile_ids)
-    
-    # --- 阶段一: 预计算价值矩阵 V[i, j, k] ---
-    # V[i, j, k] = 无人机i用k+1枚弹攻击导弹j的最大遮蔽时间
-    print("--- STAGE 1: Pre-computation of strategy values ---")
-    print("This will take a significant amount of time...")
-    
-    # k=0: 1枚弹, k=1: 2枚弹, k=2: 3枚弹
-    value_matrix = np.zeros((num_drones, num_missiles, MAX_DECOYS_PER_DRONE))
-    
-    start_time = time.time()
-    
-    for i, drone_id in enumerate(drone_ids):
-        for j, missile_id in enumerate(missile_ids):
-            for k in range(MAX_DECOYS_PER_DRONE):
-                num_decoys = k + 1
-                print(f"Optimizing for {drone_id} vs {missile_id} with {num_decoys} decoy(s)...")
-                
-                max_time, _ = find_best_continuous_strategy(drone_id, num_decoys, missile_id)
-                value_matrix[i, j, k] = max_time
-                
-                print(f"  -> Achieved max obscuration time: {max_time:.2f}s")
+    Sets up and solves the smoke bomb deployment optimization problem.
 
-    end_time = time.time()
-    print(f"\nPre-computation finished in {end_time - start_time:.2f} seconds.")
+    Args:
+        missiles_info (dict): Dictionary with missile names as keys and initial positions as values.
+        drones_info (dict): Dictionary with drone names as keys and initial positions as values.
+        num_bombs_per_drone (int): The number of bombs each drone can deploy.
+        time_horizon (int): The total simulation time in seconds.
+        time_step (float): The step size for time discretization.
+    """
+    # --- 1. Constants and Initialization ---
+    V_MISSILE = 300.0  # m/s
+    V_SINK = 3.0  # m/s
+    R_SMOKE = 10.0  # m
+    G = 9.8  # m/s^2
+    MIN_DROP_INTERVAL = 1.0 # s
+    SMOKE_DURATION = 20.0 # s
+
+    # Target Definition
+    TARGET_CENTER_BASE = np.array([0, 200, 0])
+    TARGET_RADIUS = 7.0
+    TARGET_HEIGHT = 10.0
+
+    # Time and Object Discretization
+    time_steps = np.arange(0, time_horizon, time_step)
+    num_time_steps = len(time_steps)
     
-    # --- 阶段二: Gurobi求解最优分配 ---
-    print("\n--- STAGE 2: Solving assignment problem with Gurobi ---")
+    # Generate 48 target points as per the user's method
+    target_points = []
+    for h in [0, TARGET_HEIGHT]:
+        for i in range(24):
+            angle = 2 * np.pi * i / 24
+            x = TARGET_CENTER_BASE[0] + TARGET_RADIUS * np.cos(angle)
+            y = TARGET_CENTER_BASE[1] + TARGET_RADIUS * np.sin(angle)
+            z = TARGET_CENTER_BASE[2] + h
+            target_points.append(np.array([x, y, z]))
+
+    # --- 2. Gurobi Model Setup ---
+    model = gp.Model("SmokeScreenOptimization")
+    model.params.LogToConsole = 1
+
+    # --- 3. Decision Variables ---
+    # Drone flight parameters
+    drone_speed = model.addVars(drones_info.keys(), lb=70, ub=140, name="drone_speed")
+    drone_angle = model.addVars(drones_info.keys(), lb=-np.pi, ub=np.pi, name="drone_angle") # theta
+
+    # We need to model cos and sin of the angle. Gurobi's general constraints are good for this.
+    drone_cos_angle = model.addVars(drones_info.keys(), lb=-1, ub=1, name="drone_cos_angle")
+    drone_sin_angle = model.addVars(drones_info.keys(), lb=-1, ub=1, name="drone_sin_angle")
+    for j in drones_info.keys():
+        model.addGenConstrSin(drone_angle[j], drone_sin_angle[j])
+        model.addGenConstrCos(drone_angle[j], drone_cos_angle[j])
+
+    # Bomb deployment variables
+    bombs = [(j, k) for j in drones_info.keys() for k in range(num_bombs_per_drone)]
+    t_drop = model.addVars(bombs, vtype=GRB.CONTINUOUS, lb=0, ub=time_horizon, name="t_drop")
+    fusetime = model.addVars(bombs, vtype=GRB.CONTINUOUS, lb=0, name="fusetime")
+    t_det = model.addVars(bombs, vtype=GRB.CONTINUOUS, lb=0, ub=time_horizon, name="t_det")
+
+    # Binary variable to indicate if a time step is effectively obscured
+    is_obscured = model.addVars(num_time_steps, vtype=GRB.BINARY, name="is_obscured")
+
+    # --- 4. Objective Function ---
+    # Maximize the total time the target is obscured
+    model.setObjective(gp.quicksum(is_obscured[t_idx] for t_idx in range(num_time_steps)) * time_step, GRB.MAXIMIZE)
+
+    # --- 5. Constraints ---
+    # Link drop, fuse, and detonation times
+    model.addConstrs((t_det[j,k] == t_drop[j,k] + fusetime[j,k] for j,k in bombs), "detonation_time")
+
+    # Minimum 1s interval between drops from the same drone
+    for j in drones_info.keys():
+        for k1 in range(num_bombs_per_drone):
+            for k2 in range(k1 + 1, num_bombs_per_drone):
+                 # To model |t_drop1 - t_drop2| >= 1, we use a binary variable
+                 b = model.addVar(vtype=GRB.BINARY)
+                 M = time_horizon 
+                 model.addConstr(t_drop[j, k1] - t_drop[j, k2] >= MIN_DROP_INTERVAL - M * b)
+                 model.addConstr(t_drop[j, k2] - t_drop[j, k1] >= MIN_DROP_INTERVAL - M * (1 - b))
+
+    # Obscuration Logic (this is the complex part)
+    for t_idx, t in enumerate(time_steps):
+        # This variable is 1 if all lines of sight are blocked at time t
+        all_lines_blocked_at_t = model.addVar(vtype=GRB.BINARY, name=f"all_blocked_at_t{t_idx}")
+        
+        # Intermediate variables for positions
+        # Missile positions at time t
+        missile_pos = {}
+        for i, p0_i in missiles_info.items():
+            p0_vec = np.array(p0_i)
+            dist_to_target = np.linalg.norm(p0_vec)
+            time_to_target = dist_to_target / V_MISSILE
+            if t < time_to_target:
+                 missile_pos[i] = p0_vec * (1 - (V_MISSILE * t) / dist_to_target)
+            else:
+                 missile_pos[i] = np.array([0,0,0]) # Reached target
+        
+        # We need a binary var for each line of sight (missile, target_point) being blocked
+        lines_blocked_this_step = []
+        for i in missiles_info.keys():
+            for p_idx, p_target in enumerate(target_points):
+                line_blocked = model.addVar(vtype=GRB.BINARY, name=f"line_blocked_t{t_idx}_m{i}_p{p_idx}")
+                lines_blocked_this_step.append(line_blocked)
+
+                # This line is blocked if AT LEAST ONE cloud intercepts it.
+                cloud_intercepts = []
+                for j, k in bombs:
+                    cloud_intercepts_this = model.addVar(vtype=GRB.BINARY, name=f"intercept_t{t_idx}_m{i}_p{p_idx}_b{j}{k}")
+                    cloud_intercepts.append(cloud_intercepts_this)
+
+                    # Cloud active condition
+                    # cloud_is_active 应该等价于 (t_det[j,k] <= t) 且 (t <= t_det[j,k] + SMOKE_DURATION)
+                    cloud_is_active = model.addVar(vtype=GRB.BINARY, name=f"cloud_is_active_{t_idx}_{j}{k}")
+                    # 用Big-M方法将区间条件转为与二进制变量关联的约束
+                    M = 1e9
+                    model.addConstr(t_det[j,k] - t <= M * (1 - cloud_is_active), name=f"active_start_{t_idx}_{j}{k}")
+                    model.addConstr(t - (t_det[j,k] + SMOKE_DURATION) <= M * (1 - cloud_is_active), name=f"active_end_{t_idx}_{j}{k}")
+
+                    # --- Position Calculations (Requires helper variables) ---
+                    # Drone position at drop time
+                    p_fy_drop_x = drones_info[j][0] + drone_speed[j] * drone_cos_angle[j] * t_drop[j,k]
+                    p_fy_drop_y = drones_info[j][1] + drone_speed[j] * drone_sin_angle[j] * t_drop[j,k]
+                    
+                    # Detonation point
+                    p_det_x = p_fy_drop_x
+                    p_det_y = p_fy_drop_y
+                    p_det_z = drones_info[j][2] - 0.5 * G * fusetime[j,k] * fusetime[j,k]
+
+                    # Cloud center at time t
+                    p_cloud_x = p_det_x
+                    p_cloud_y = p_det_y
+                    p_cloud_z = p_det_z - V_SINK * (t - t_det[j,k])
+
+                    # --- Geometric check using the Parametric Line Segment ("moving point") method ---
+                    # This method is generally more efficient for solvers than the vector projection method.
+                    M = 1e9 # A large constant for the Big-M method
+
+                    # 1. Define the line segment from missile (A) to target point (B)
+                    missile_A = missile_pos[i]
+                    target_B = p_target
+                    AB = target_B - missile_A # This is a constant vector for the current loop iteration
+
+                    # 2. Introduce a parameter 's' to define a moving point Q on the line segment AB
+                    # Q = A + s * AB, where s is in [0, 1]
+                    s = model.addVar(lb=0.0, ub=1.0, vtype=GRB.CONTINUOUS, name=f"s_{t_idx}_{i}_{p_idx}_{j}{k}")
+
+                    # Coordinates of the moving point Q. These are Gurobi expressions.
+                    Qx = missile_A[0] + s * AB[0]
+                    Qy = missile_A[1] + s * AB[1]
+                    Qz = missile_A[2] + s * AB[2]
+
+                    # 3. Calculate the vector from the moving point (Q) to the smoke cloud center (P)
+                    dx = p_cloud_x - Qx
+                    dy = p_cloud_y - Qy
+                    dz = p_cloud_z - Qz
+
+                    # 4. Apply the Big-M constraint.
+                    # If cloud_intercepts_this is 1, then the squared distance d2 = dx^2+dy^2+dz^2 must be <= R_SMOKE^2.
+                    # Otherwise, the constraint is relaxed by the large M term.
+                    # The entire expression is quadratic, so we use addQConstr.
+                    dist_sq = model.addVar(name=f"dist_sq_{t_idx}_{i}_{p_idx}_{j}{k}")
+                    model.addConstr(dist_sq == (dx*dx + dy*dy + dz*dz), name=f"dist_sq_const_{t_idx}_{i}_{p_idx}_{j}{k}")
+                    model.addConstr(dist_sq - R_SMOKE**2 <= M * (1 - cloud_intercepts_this),
+                                     name=f"dist_check_{t_idx}_{i}_{p_idx}_{j}{k}")
+                    
+                    # Link to active status (This constraint remains from the previous logic)
+                    model.addConstr(cloud_intercepts_this <= cloud_is_active)
+
+                # The line is blocked if the sum of intercepts is >= 1
+                model.addConstr(gp.quicksum(cloud_intercepts) >= line_blocked)
+
+        # all_lines_blocked is 1 only if every single line_blocked var is 1
+        model.addConstr(gp.quicksum(lines_blocked_this_step) >= len(lines_blocked_this_step) * all_lines_blocked_at_t)
+
+        # Link to the main objective variable
+        model.addConstr(is_obscured[t_idx] == all_lines_blocked_at_t)
+
+    # --- 6. Solve ---
+    model.setParam('NonConvex', 2) # Important for quadratic constraints
+    model.setParam('TimeLimit', 3600) # Set a time limit (e.g., 1 hour)
+    model.setParam('MIPGap', 0.05) # Stop when a 5% optimality gap is reached
     
-    assignment = solve_assignment_problem(value_matrix)
-    
-    # --- 阶段三: 输出最终结果 ---
-    print("\n--- FINAL RESULT: Optimal Assignment ---")
-    if not assignment:
-        print("No assignment was found.")
+    model.optimize()
+
+    # --- 7. Print Results ---
+    if model.status == GRB.OPTIMAL or model.status == GRB.TIME_LIMIT:
+        print("Optimization finished.")
+        print(f"Total effective obscuration time: {model.ObjVal:.2f} seconds")
+        
+        for j in drones_info.keys():
+            print(f"\n--- Drone {j} Strategy ---")
+            print(f"  Flight Speed: {drone_speed[j].X:.2f} m/s")
+            print(f"  Flight Angle: {np.rad2deg(drone_angle[j].X):.2f} degrees")
+            for k in range(num_bombs_per_drone):
+                print(f"  Bomb {k+1}:")
+                print(f"    Drop Time: {t_drop[j,k].X:.2f} s")
+                print(f"    Fuse Time: {fusetime[j,k].X:.2f} s")
+                print(f"    Detonation Time: {t_det[j,k].X:.2f} s")
     else:
-        total_value = 0
-        for drone_name, (missile_name, num_decoys) in assignment.items():
-            print(f"Assign {drone_name} to attack {missile_name} using {num_decoys} decoy(s).")
-            # 查找对应的价值
-            i = drone_ids.index(drone_name)
-            j = missile_ids.index(missile_name)
-            k = num_decoys - 1
-            value = value_matrix[i, j, k]
-            total_value += value
-            print(f"  - Expected obscuration time from this task: {value:.2f}s")
-        print(f"\nTotal expected obscuration time (summed): {total_value:.2f}s")
-
-    print("\nNote: To generate the final result3.xlsx, you would re-run the continuous optimizer")
-    print("for each task in the final assignment to get the detailed flight and drop parameters,")
-    print("and then format them into the required excel file.")
-
-
-if __name__ == "__main__":
-    run_q5_solution()
+        print("No optimal solution found.")
+        
+# --- Example Usage (corresponds to Problem 4) ---
+if __name__ == '__main__':
+    # Initial positions from the problem description
+    missiles = {
+        'M1': (20000, 0, 2000),
+    }
+    drones = {
+        'FY1': (17800, 0, 1800),
+        # 'FY2': (12000, 1400, 1400),
+        # 'FY3': (6000, -3000, 700),
+    }
+    
+    # To run for other problems, change the inputs here.
+    # For example, for Problem 5:
+    # missiles = {'M1':..., 'M2':..., 'M3':...}
+    # drones = {'FY1':..., 'FY2':..., ... 'FY5':...}
+    # num_bombs = 3
+    
+    solve_smoke_deployment(
+        missiles_info=missiles,
+        drones_info=drones,
+        num_bombs_per_drone=1, 
+        time_horizon=80,      # e.g., 80 seconds simulation
+        time_step=0.1         # Coarse time step to make it solvable
+    )

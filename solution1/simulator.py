@@ -75,7 +75,7 @@ def solve_smoke_deployment(missiles_info, drones_info, flight_info, bombs_info, 
     ##
     # Binary variable to indicate if a time step is effectively obscured
     is_obscured = dict.fromkeys(range(num_time_steps), 0)
-
+    bombs_job = {b: {t: set() for t in range(num_time_steps)} for b in bombs}
     # Obscuration Logic (this is the complex part)
     for t_idx, t in enumerate(time_steps):
         # This variable is 1 if all lines of sight are blocked at time t
@@ -103,7 +103,7 @@ def solve_smoke_deployment(missiles_info, drones_info, flight_info, bombs_info, 
 
         for j, k in bombs:
             if t_det[j,k] > t or t > t_det[j,k] + SMOKE_DURATION:
-                        continue
+                continue
             p_drop_x[j,k] = drones_info[j][0] + drone_speed[j] * drone_cos_angle[j] * t_drop[j,k]
             p_drop_y[j,k] = drones_info[j][1] + drone_speed[j] * drone_sin_angle[j] * t_drop[j,k]
             p_det_x[j,k] = p_drop_x[j,k] + drone_speed[j] * drone_cos_angle[j] * fusetime[j,k]
@@ -121,25 +121,10 @@ def solve_smoke_deployment(missiles_info, drones_info, flight_info, bombs_info, 
                     if t_det[j,k] > t or t > t_det[j,k] + SMOKE_DURATION:
                         continue
 
-                    # --- Position Calculations (Requires helper variables) ---
-                    # Drone position at drop time
-                    p_fy_drop_x = drones_info[j][0] + drone_speed[j] * drone_cos_angle[j] * t_drop[j,k]
-                    p_fy_drop_y = drones_info[j][1] + drone_speed[j] * drone_sin_angle[j] * t_drop[j,k]
-                    
-                    # Detonation point
-                    p_det_x = p_fy_drop_x + drone_speed[j] * drone_cos_angle[j] * fusetime[j,k]
-                    p_det_y = p_fy_drop_y + drone_speed[j] * drone_sin_angle[j] * fusetime[j,k]
-                    p_det_z = drones_info[j][2] - 0.5 * G * fusetime[j,k] * fusetime[j,k]
-
-                    # Cloud center at time t
-                    p_cloud_x = p_det_x
-                    p_cloud_y = p_det_y
-                    p_cloud_z = p_det_z - V_SINK * (t - t_det[j,k])
-
                     # 1. Define the line segment from missile (A) to target point (B)
                     missile_A = missile_pos[i]
                     target_B = p_target
-                    cloud_C = np.array([p_cloud_x, p_cloud_y, p_cloud_z])
+                    cloud_C = np.array([p_cloud_x[j,k], p_cloud_y[j,k], p_cloud_z[j,k]])
                     AB = target_B - missile_A 
                     AC = cloud_C - missile_A
                     BC = cloud_C - target_B
@@ -163,14 +148,15 @@ def solve_smoke_deployment(missiles_info, drones_info, flight_info, bombs_info, 
 
                     if dist_sq <= R_SMOKE * R_SMOKE:
                         line_blocked = 1
-                        # print(f" time: {t}, target_point: {p_target}, cloud_C {j,k}: {cloud_C}")
-                        break
+                        bombs_job[j,k][t_idx].add(i)
+                        # if t < 6 :
+                        #     print(f" time: {t}, target_point: {p_target}, cloud_C {j,k}: {cloud_C}")
                 if line_blocked == 0:
                     break
             if line_blocked == 0:
                 break
         is_obscured[t_idx] = line_blocked
-        print(f" time: {t}, target_point: {p_target}, cloud_C {j,k}: {cloud_C}")
+
         # print(f"Time {t}s 目标是否被遮挡: {is_obscured[t_idx]}")
 
     total_coverage = sum(is_obscured[t_idx] * time_step for t_idx in range(num_time_steps)) 
@@ -178,7 +164,15 @@ def solve_smoke_deployment(missiles_info, drones_info, flight_info, bombs_info, 
     # --- 8. Print Results ---
     print("Optimization finished.")
     print(f"Total effective obscuration time: {total_coverage:.2f} seconds")
-        
+    
+    time_blocks = dict.fromkeys(bombs,0)
+    for j, k in bombs:
+        for t_idx,blocked in bombs_job[j,k].items():
+            if is_obscured[t_idx] and len(blocked) > 0:
+                # print(f"Bomb ({j},{k}) blocks missile {blocked} at time {time_steps[t_idx]}")
+                time_blocks[j,k] += time_step
+    print(f"Total time blocks: {time_blocks}")
+
 # --- Example Usage (corresponds to Problem 4) ---
 if __name__ == '__main__':
     # Initial positions from the problem description
@@ -192,13 +186,13 @@ if __name__ == '__main__':
     }
     
     flight = {
-        'FY1': (139.93, np.pi * 179.65 / 180),
+        'FY1': (139.99, np.pi * 179.65 / 180),
     }
 
     bombs = {
-        ('FY1', 0): (0.2, 3.76),
-        ('FY1', 1): (3.75, 5.41),
-        ('FY1', 2): (5.62, 6.07)
+        ('FY1', 0): (0, 3.61),
+        ('FY1', 1): (3.66, 5.33),
+        ('FY1', 2): (5.55, 6.06)
     }
 
     # To run for other problems, change the inputs here.
@@ -214,5 +208,5 @@ if __name__ == '__main__':
         bombs_info=bombs,
         num_bombs_per_drone=3, 
         time_horizon=20,      # e.g., 80 seconds simulation
-        time_step=0.0001         # Coarse time step to make it solvable
+        time_step=0.01         # Coarse time step to make it solvable
     )

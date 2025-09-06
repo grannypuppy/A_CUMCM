@@ -11,6 +11,7 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 import time
+import torch
 
 # --- 1. 从 simulator.py 中借鉴的核心模拟逻辑和常量 ---
 # 将模拟器逻辑封装到 Gym 环境中
@@ -225,6 +226,76 @@ class SmokeScreenEnv(gym.Env):
         
         return total_obscured_time, penalty
 
+# --- NEW FUNCTION: To encode a known solution into a normalized action vector ---
+def encode_solution_to_action(flight_info, bombs_info, drones_info, num_bombs_per_drone, time_horizon):
+    """
+    将一个已知的决策方案 (物理单位) 编码为归一化的动作向量 [-1, 1].
+    这是 SmokeScreenEnv._decode_action 方法的逆操作。
+    """
+    bombs = [(j, k) for j in drones_info.keys() for k in range(num_bombs_per_drone)]
+    action = []
+
+    # 1. 编码无人机飞行参数
+    for drone_id in drones_info.keys():
+        speed, angle = flight_info[drone_id]
+        # 速度: [70, 140] -> [-1, 1]
+        norm_speed = (speed - 105) / 35
+        action.append(norm_speed)
+        # 角度: [0, 2*pi] -> [-1, 1]
+        norm_angle = (angle - np.pi) / np.pi
+        action.append(norm_angle)
+
+    # 2. 编码烟雾弹部署参数
+    for bomb_id in bombs:
+        t_drop, fusetime = bombs_info[bomb_id]
+        # 投掷时间: [0, time_horizon/2] -> [-1, 1]
+        norm_t_drop = (t_drop - (time_horizon / 4)) / (time_horizon / 4)
+        action.append(norm_t_drop)
+        # 引信时间: [1, 10] -> [-1, 1]
+        norm_fusetime = (fusetime - 5.5) / 4.5
+        action.append(norm_fusetime)
+        
+    return np.array(action, dtype=np.float32)
+
+# --- NEW FUNCTION: To pre-train the agent's policy network ---
+def pretrain_agent_with_expert(model, expert_action, initial_obs, epochs=100, learning_rate=3e-4):
+    """
+    使用专家动作对 PPO 模型的策略网络进行监督学习预训练。
+    """
+    print("\n--- 开始策略网络预训练 ---")
+    
+    # 转换为 PyTorch 张量
+    expert_action_tensor = torch.tensor(expert_action, dtype=torch.float32).unsqueeze(0)
+    initial_obs_tensor = torch.tensor(initial_obs, dtype=torch.float32).unsqueeze(0)
+    
+    # 获取策略网络和优化器
+    policy = model.policy
+    optimizer = policy.optimizer
+    
+    # 定义损失函数
+    loss_fn = torch.nn.MSELoss()
+    
+    start_time = time.time()
+    for epoch in range(epochs):
+        # 从策略网络获取当前动作的均值
+        # 注意: 我们只关心均值，因为这是策略的核心输出
+        obs_features = policy.extract_features(initial_obs_tensor)
+        action_mean = policy.action_net(policy.mlp_extractor.policy_net(obs_features))
+
+        # 计算损失
+        loss = loss_fn(action_mean, expert_action_tensor)
+        
+        # 反向传播和优化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        if (epoch + 1) % 20 == 0:
+            print(f"预训练 Epoch [{epoch+1}/{epochs}], 损失: {loss.item():.6f}")
+
+    end_time = time.time()
+    print(f"预训练完成！耗时: {end_time - start_time:.2f} 秒")
+
 
 if __name__ == '__main__':
     # --- 问题定义 ---
@@ -247,7 +318,7 @@ if __name__ == '__main__':
     check_env(env)
     print("环境检查通过！")
 
-    # --- 2. 创建并训练 PPO 模型 ---
+    # --- 2. 创建 PPO 模型 (此时策略是随机初始化的) ---
     log_dir = "./ppo_smokescreen_logs/"
     model = PPO(
         "MlpPolicy", 
@@ -262,7 +333,32 @@ if __name__ == '__main__':
         ent_coef=0.01,     # 鼓励探索的熵系数
     )
 
-    print("\n--- 开始训练 PPO 模型 ---")
+    # --- NEW STEP: 定义专家策略并进行预训练 ---
+    # 这是从 simulator.py 中提取的优秀解
+    expert_flight_info = {
+        'FY1': (139.99, np.pi * 179.65 / 180),
+    }
+    expert_bombs_info = {
+        ('FY1', 0): (0, 3.61),
+        ('FY1', 1): (3.66, 5.33),
+        ('FY1', 2): (5.55, 6.06)
+    }
+
+    # 将专家策略编码为归一化的动作向量
+    expert_action_normalized = encode_solution_to_action(
+        expert_flight_info,
+        expert_bombs_info,
+        problem_drones,
+        problem_num_bombs,
+        problem_time_horizon
+    )
+
+    # 执行预训练
+    pretrain_agent_with_expert(model, expert_action_normalized, env.initial_obs, epochs=200)
+
+
+    # --- 3. 开始标准的强化学习训练 (从预训练好的策略开始) ---
+    print("\n--- 开始强化学习微调训练 ---")
     start_time = time.time()
     # 增加训练步数以获得更好的结果，例如 100000 或更高
     model.learn(total_timesteps=50000)
@@ -270,7 +366,7 @@ if __name__ == '__main__':
     print(f"训练完成！耗时: {end_time - start_time:.2f} 秒")
     model.save("ppo_smokescreen_model")
 
-    # --- 3. 使用训练好的模型进行预测并展示结果 ---
+    # --- 4. 使用训练好的模型进行预测并展示结果 ---
     print("\n\n--- 使用训练好的模型寻找最优策略 ---")
     obs, _ = env.reset()
     action, _states = model.predict(obs, deterministic=True)
@@ -292,7 +388,7 @@ if __name__ == '__main__':
         print(f"  引信时间: {fusetime:.2f} s")
         print(f"  -> 引爆时间: {t_drop + fusetime:.2f} s")
         
-    # --- 4. 使用最优策略运行一次高精度模拟 ---
+    # --- 5. 使用最优策略运行一次高精度模拟 ---
     print("\n--- 使用最优策略进行最终高精度模拟评估 ---")
     eval_env = SmokeScreenEnv(
         missiles_info=problem_missiles,

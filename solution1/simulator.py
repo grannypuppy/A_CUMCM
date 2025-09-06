@@ -173,6 +173,8 @@ def solve_smoke_deployment(missiles_info, drones_info, flight_info, bombs_info, 
                 time_blocks[j,k] += time_step
     print(f"Total time blocks: {time_blocks}")
 
+    return total_coverage
+
 # --- Example Usage (corresponds to Problem 4) ---
 if __name__ == '__main__':
     # Initial positions from the problem description

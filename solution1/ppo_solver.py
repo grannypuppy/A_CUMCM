@@ -139,6 +139,8 @@ class SmokeScreenEnv(gym.Env):
     def run_simulation(self, flight_info, bombs_info):
         """根据给定的决策执行一次完整的物理模拟"""
         
+        verbose = True
+
         # --- 1. 初始化决策变量 ---
         drone_speed, drone_angle = {}, {}
         drone_cos_angle, drone_sin_angle = {}, {}
@@ -159,71 +161,96 @@ class SmokeScreenEnv(gym.Env):
             drop_times_for_drone = sorted([t_drop[(j,k)] for k in range(self.num_bombs_per_drone)])
             for i in range(len(drop_times_for_drone) - 1):
                 if drop_times_for_drone[i+1] - drop_times_for_drone[i] < MIN_DROP_INTERVAL:
-                    penalty += 50 # 对违反最小投弹间隔的行为进行惩罚
+                    penalty += 20 # 对违反最小投弹间隔的行为进行惩罚
 
         t_det = {(j,k): t_drop[(j,k)] + fusetime[(j,k)] for j, k in self.bombs}
         
+        if verbose:
+            for j in self.drones_info.keys():
+                print(f"Drone {j} speed: {drone_speed[j]}, angle: {np.rad2deg(drone_angle[j]):.2f} degrees")
+                for k in range(self.num_bombs_per_drone):
+                    print(f"Bomb {j},{k} drop time: {t_drop[(j,k)]}, fuse time: {fusetime[(j,k)]}")
+                    print(f"Bomb {j},{k} detonation time: {t_det[(j,k)]}")
+
         # --- 3. 模拟主循环 ---
         time_steps = np.arange(0, self.time_horizon, self.time_step)
         num_time_steps = len(time_steps)
         total_obscured_time = 0.0
+        is_obscured = dict.fromkeys(range(num_time_steps), 0)
 
         for t_idx, t in enumerate(time_steps):
             missile_pos = {}
             for i, p0_i in self.missiles_info.items():
                 p0_vec = np.array(p0_i)
-                target_vec = TARGET_CENTER_BASE
-                direction_vec = target_vec - p0_vec
-                dist_to_target = np.linalg.norm(direction_vec)
-                if dist_to_target > 0:
-                    time_to_target = dist_to_target / V_MISSILE
-                    missile_pos[i] = p0_vec + direction_vec * (V_MISSILE * t / dist_to_target) if t < time_to_target else target_vec
+                dist_to_target = np.linalg.norm(p0_vec)
+                time_to_target = dist_to_target / V_MISSILE
+                if t < time_to_target:
+                    missile_pos[i] = p0_vec * (1 - (V_MISSILE * t) / dist_to_target)
                 else:
-                    missile_pos[i] = target_vec
+                    missile_pos[i] = np.array([0,0,0]) # Reached target
+            
+            p_drop_x = dict.fromkeys(self.bombs, 0)
+            p_drop_y = dict.fromkeys(self.bombs, 0)
+            p_det_x = dict.fromkeys(self.bombs, 0)
+            p_det_y = dict.fromkeys(self.bombs, 0)
+            p_det_z = dict.fromkeys(self.bombs, 0)
+            p_cloud_x = dict.fromkeys(self.bombs, 0)
+            p_cloud_y = dict.fromkeys(self.bombs, 0)
+            p_cloud_z = dict.fromkeys(self.bombs, 0)
 
-            is_target_obscured_this_step = False
+            for j, k in self.bombs:
+                if t_det[j,k] > t or t > t_det[j,k] + SMOKE_DURATION:
+                    continue
+                p_drop_x[j,k] = self.drones_info[j][0] + drone_speed[j] * drone_cos_angle[j] * t_drop[j,k]
+                p_drop_y[j,k] = self.drones_info[j][1] + drone_speed[j] * drone_sin_angle[j] * t_drop[j,k]
+                p_det_x[j,k] = p_drop_x[j,k] + drone_speed[j] * drone_cos_angle[j] * fusetime[j,k]
+                p_det_y[j,k] = p_drop_y[j,k] + drone_speed[j] * drone_sin_angle[j] * fusetime[j,k]
+                p_det_z[j,k] = self.drones_info[j][2] - 0.5 * G * fusetime[j,k] * fusetime[j,k]
+                p_cloud_x[j,k] = p_det_x[j,k]
+                p_cloud_y[j,k] = p_det_y[j,k]
+                p_cloud_z[j,k] = p_det_z[j,k] - V_SINK * (t - t_det[j,k])
+
             for i in self.missiles_info.keys():
                 for p_target in self.target_points:
-                    line_blocked = False
+                    is_los_blocked_by_any_bomb = False
                     missile_A = missile_pos[i]
                     target_B = p_target
-                    AB_sq = np.dot(target_B - missile_A, target_B - missile_A)
-                    if AB_sq == 0: continue
+                    AB = target_B - missile_A
+                    # AB_sq = np.dot(AB, AB)
+                    # if AB_sq == 0: continue
 
                     for j, k in self.bombs:
                         if not (t_det[(j,k)] <= t <= t_det[(j,k)] + SMOKE_DURATION):
                             continue
 
-                        p_drop_x = self.drones_info[j][0] + drone_speed[j] * drone_cos_angle[j] * t_drop[(j,k)]
-                        p_drop_y = self.drones_info[j][1] + drone_sin_angle[j] * t_drop[(j,k)]
-                        p_det_z = self.drones_info[j][2] - 0.5 * G * fusetime[(j,k)]**2
-                        p_det_x = p_drop_x + drone_speed[j] * drone_cos_angle[j] * fusetime[(j,k)]
-                        p_det_y = p_drop_y + drone_sin_angle[j] * drone_sin_angle[j] * fusetime[(j,k)]
-                        
-                        p_cloud_center_z = p_det_z - V_SINK * (t - t_det[(j,k)])
-                        cloud_C = np.array([p_det_x, p_det_y, p_cloud_center_z])
-
+                        cloud_C = np.array([p_cloud_x[j,k], p_cloud_y[j,k], p_cloud_z[j,k]])
                         AC = cloud_C - missile_A
-                        s = np.dot(AC, target_B - missile_A) / AB_sq
+                        BC = cloud_C - target_B
+
+                        s = np.dot(AC, AB) / np.dot(AB, AB)
                         
                         dist_sq = 0
-                        if s < 0: dist_sq = np.dot(AC, AC)
-                        elif s > 1: dist_sq = np.dot(cloud_C - target_B, cloud_C - target_B)
-                        else: dist_sq = np.dot(AC, AC) - s * s * AB_sq
+                        if s < 0:
+                            dist_sq = np.dot(AC, AC)
+                        elif s > 1:
+                            dist_sq = np.dot(BC, BC)
+                        else:
+                            projection = missile_A + s * AB
+                            dist_sq = np.dot(cloud_C - projection, cloud_C - projection)
                         
                         if dist_sq <= R_SMOKE**2:
-                            line_blocked = True
-                            break
+                            is_los_blocked_by_any_bomb = True
+                            break # This LoS is blocked, no need to check other bombs.
                     
-                    if line_blocked:
-                        is_target_obscured_this_step = True
-                        break
-                if is_target_obscured_this_step:
-                    break
-            
-            if is_target_obscured_this_step:
-                total_obscured_time += self.time_step
+                    if not is_los_blocked_by_any_bomb:
+                        break # No need to check other LoS for this missile.
+
+                if not is_los_blocked_by_any_bomb:
+                    # This missile is not fully blocked, so the target is not obscured.
+                    break # No need to check other missiles.
+            is_obscured[t_idx] = is_los_blocked_by_any_bomb
         
+        total_obscured_time = sum(is_obscured[t_idx] * self.time_step for t_idx in range(num_time_steps))
         return total_obscured_time, penalty
 
 # --- NEW FUNCTION: To encode a known solution into a normalized action vector ---
